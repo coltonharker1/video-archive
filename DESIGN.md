@@ -317,8 +317,26 @@ type Identity struct {
 }
 ```
 
-**Cross-video matching (v2):** After clustering within a single video, compare cluster
-centroids against known identities from previous videos. Propose matches above threshold.
+**Cross-video matching:** After clustering within a single video, every pending
+cluster's centroid is compared against every confirmed cluster centroid in the
+archive. An identity's reference set is the collection of *all* confirmed
+cluster centroids assigned to it — not their average. Matching uses **max
+cosine similarity over the reference set**: a new cluster is attributed to
+whichever identity has the single closest confirmed centroid, provided that
+similarity clears the threshold (default 0.5, auto-apply configurable).
+
+Why max-over-refs instead of averaged centroid:
+
+- **Age progression:** ArcFace is invariant to pose/lighting/expression but
+  *not age*. Averaging a baby centroid and an adult centroid produces a
+  midpoint vector that matches neither age well. Max-over-refs lets a single
+  identity span multiple ages — new baby appearances match the baby
+  references, new adult appearances match the adult references.
+- **Pose/lighting diversity:** Even within one age range, different poses
+  (profile, three-quarter, front) don't average linearly in embedding space.
+  Max-over-refs is robust to this.
+
+Enabled in `va run` and `va run-all` by default (`AutoApply: true`).
 
 ### 7. User Review UI
 
@@ -1350,9 +1368,16 @@ so future-you can resume without re-deriving them.
 | `LinkModeHardlink` | `--link` | `os.Link` into `masters/YYYY/` | Large files, same filesystem as source. Zero extra disk. Source deletion keeps archive intact. **Modifications to the source are visible in the archive** (same inode) |
 | `LinkModeSymlink` | `--symlink` | `os.Symlink` into `masters/YYYY/` | Cross-filesystem case. **Breaks if the source file moves or is deleted.** |
 
-Flags are mutually exclusive (cobra `MarkFlagsMutuallyExclusive`) and wired into both
-`va ingest` and `va run`. Hardlink is the right default for the big-file archive (the
-150GB+ home-video collection on `~/Desktop/Home Videos`).
+Flags are mutually exclusive (cobra `MarkFlagsMutuallyExclusive`) and wired into
+`va ingest`, `va ingest-dir`, and `va run`. Hardlink is the right default for the
+big-file archive (the ~73 GB home-video collection on `~/Desktop/Home Videos`).
+
+### Undated recordings
+
+`pipeline.IngestFile` allows empty dates (stored as empty in the `date` column).
+Files without a recoverable date from the filename land under
+`masters/unknown/` instead of getting stamped with today's date. The review UI
+handles empty dates gracefully (displays `—`).
 
 ## Frame dimensions in DB
 
@@ -1376,6 +1401,14 @@ Beyond what's in the earlier sections:
   `va review {id}` still works to land directly on that recording's review page.
 - `va backfill-frames` — populate missing frame dims (see above).
 - `va ingest` / `va run` — added `--link` / `--symlink`.
+- `va ingest-dir <dir>` — recursive batch ingest with filename-based date
+  extraction (`YYYY-MM-DD`, `YYYY_MM_DD`, or bare 19xx/20xx year). Supports
+  `--dry-run` to preview. See the Scaling section below.
+- `va run-all` — runs the full pipeline on every unprocessed recording,
+  shortest first. Idempotent — re-running skips already-done stages.
+  `--limit N`, `--skip-match`, `--dry-run` flags available.
+- `va scenes <id>` / `va scene-map <id>` — shot-boundary detection and
+  face-informed scene merging + people attribution.
 
 ## Browser-video compatibility
 
@@ -1591,6 +1624,7 @@ For each scene S:
     overlap_start = max(S.start_ms, SEG.start_ms)
     overlap_end   = min(S.end_ms, SEG.end_ms)
     overlap_ms    = overlap_end - overlap_start
+    if overlap_ms < 500ms: continue            # reject boundary-straddle artifacts
     first_ms      = overlap_start
     → INSERT scene_people(S.id, SEG.identity_id, first_ms, overlap_ms)
 ```
@@ -1601,6 +1635,42 @@ takes the earliest.
 
 Scene-people is regenerated from scratch each time (delete + reinsert), same as
 segments. It's a derived view.
+
+### The 500ms minimum overlap (boundary-straddle fix)
+
+Segments are merged bottom-up with a 5-second within-person gap threshold,
+which means a segment's start/end times can trail the last detection by up
+to a few seconds. When a real scene boundary falls inside this trailing
+slack, the segment straddles both sides.
+
+Example from the archive: a sunset scene (empty, no faces) was followed
+by a Mom-on-phone scene starting at `8:32.28`. Mom's segment was
+`8:32.000–8:36.000` — straddling the boundary by 278 ms on the sunset side.
+Any-overlap attribution put Mom in *both* scenes, which then:
+
+1. Polluted the UI: the sunset showed "Mom" as a present person
+2. Triggered a false face-merge: adjacent scenes "both had Mom" → merged
+
+Requiring `overlap ≥ 500 ms` (`MinScenePeopleOverlapMs` in `pipeline/scene_map.go`
+and `SceneMergeOptions.MinSegmentOverlapMs` in `pipeline/scene_merge.go`)
+rejects these artifacts while preserving genuine brief appearances.
+
+## Face-informed scene merging
+
+`MergeScenesByPeople` (`pipeline/scene_merge.go`) is a post-processing pass
+that catches over-segmentation where `scdet` picks up spurious boundaries
+inside a continuous shot (camera wobble, pan, VHS noise bursts).
+
+**Rule:** merge two adjacent scenes if:
+- Both have at least one attributed person (empty scenes are barriers)
+- Their identity sets have Jaccard similarity ≥ 0.5 (default, configurable)
+- Segment attribution uses the 500 ms minimum described above
+
+Segment attribution is computed locally (not read from `scene_people`) so
+the merger can run before `scene-map`. The merge rewrites the `scenes`
+table; `scene-map` then runs on the merged scenes.
+
+Tunable via `va scene-map --overlap 0.5` and `--no-merge` to disable.
 
 ## Search + Ranking (future)
 
