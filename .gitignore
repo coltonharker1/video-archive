@@ -1,0 +1,7 @@
+/va
+*.exe
+.DS_Store
+worker/.venv/
+worker/models/
+__pycache__/
+*.pyc
