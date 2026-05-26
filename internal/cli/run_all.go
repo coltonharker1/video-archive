@@ -146,6 +146,26 @@ func processOne(cfg config.Config, db *store.DB, ml *mlclient.Client, mlAvailabl
 	// (Embedding happens inside DetectFaces — the ML worker returns both
 	// detections and embeddings in one pass.)
 
+	// Fill-sample around detections, then re-run detect on new frames.
+	fillResult, err := pipeline.FillSampleAroundDetections(ctx, cfg, db, id, pipeline.DefaultFillOptions())
+	if err != nil {
+		slog.Warn("fill failed; continuing with scout-only detections", "recording_id", id, "err", err)
+	} else if fillResult.Skipped {
+		switch fillResult.SkipReason {
+		case "tracks_exist":
+			fmt.Printf("  fill: skipped (recording already tracked; fill is pre-track only)\n")
+		default:
+			fmt.Printf("  fill: %d frames (cached)\n", fillResult.FrameCount)
+		}
+	} else if fillResult.FrameCount > 0 {
+		fmt.Printf("  fill: %d frames across %d windows\n", fillResult.FrameCount, fillResult.WindowCount)
+		if fillDetect, err := pipeline.DetectFaces(ctx, cfg, db, ml, id); err != nil {
+			return fmt.Errorf("fill detect: %w", err)
+		} else if !fillDetect.Skipped {
+			fmt.Printf("  fill-detect: +%d faces across %d frames\n", fillDetect.FacesFound, fillDetect.FramesDone)
+		}
+	}
+
 	// Track
 	trackResult, err := pipeline.TrackFaces(ctx, cfg, db, id)
 	if err != nil {

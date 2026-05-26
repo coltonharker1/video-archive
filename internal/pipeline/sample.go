@@ -104,7 +104,7 @@ func SampleRecording(ctx context.Context, cfg config.Config, db *store.DB, recor
 			Height:      h,
 		}
 
-		if _, err := db.InsertFrame(frame); err != nil {
+		if _, _, err := db.InsertFrame(frame); err != nil {
 			return nil, fmt.Errorf("inserting frame: %w", err)
 		}
 		registered++

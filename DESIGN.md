@@ -705,15 +705,24 @@ POST /embed   {"crop_paths": [...], "batch_size": 64}
 - **Embedding:** 32-128 crops per batch (smaller images, less memory)
 - **CPU fallback:** batch size 1-4
 
-### GPU vs CPU
+### CPU vs CoreML (measured)
 
-| Operation | CPU (M-series) | GPU (Metal) |
-|-----------|----------------|-------------|
-| RetinaFace detect | ~50ms/frame | ~10ms/frame |
-| ArcFace embed | ~15ms/face | ~3ms/face |
-| 1hr video (1,800 frames, 3 faces avg) | ~27 min detect, ~1.5 min embed | ~5 min detect, ~18s embed |
+Worker is configurable via `--provider {auto,coreml,cpu}` (`worker/worker.py`).
+`auto` picks CoreML on macOS and falls back to CPU on init failure.
 
-Start with CPU. M-series Macs are fast enough for MVP. Add CoreML/Metal provider in v2.
+| | CPU (M-series) | CoreML (ANE/GPU) | ratio |
+|---|---|---|---|
+| 126 VHS frames (colton-being-colton) | 11.75 s | 5.88 s | **2.0×** |
+| per-frame detect+embed | ~93 ms | ~47 ms | 2.0× |
+| model load (one-time) | ~2 s | ~5 s | +3 s graph compile |
+| projected 18-hr archive detect | ~8 hr | **~4 hr** | — |
+
+The 5× optimism in earlier drafts didn't materialize. The bottleneck is that
+the worker does one `cv2.imread` + `face_app.get(img)` per frame inside the
+`/detect` loop, so CoreML can't amortize kernel launches across a batch — ANE
+shines with bigger per-call tensors. A true 5× win would require worker-side
+batch inference, which insightface's `FaceAnalysis.get()` doesn't support
+out of the box.
 
 ### Concurrency Model
 
@@ -1144,7 +1153,6 @@ va report <id>          # after review
 
 | Feature | Priority | Notes |
 |---------|----------|-------|
-| Adaptive sampling (scout/fill/track) | High | Biggest perf win for long videos |
 | Clip export | High | Users will want this fast |
 | Cross-video identity matching | High | Core value for archive use case |
 | Batch ingest (`ingest-dir`) | Medium | Parallelize with audio-archive pattern |
@@ -1152,7 +1160,6 @@ va report <id>          # after review
 | Split cluster UI | Medium | HDBSCAN sub-clustering |
 | Scene detection | Medium | Improves tracking accuracy |
 | Face quality filtering | Medium | Suppress bad embeddings pre-clustering |
-| GPU acceleration (CoreML/Metal) | Medium | ONNX GPU provider for faster detection |
 | Progress bars / TUI | Low | Nice UX for long jobs |
 | Full-text search over identities | Low | "Show me all videos with Grandma" |
 | Timeline visualization | Low | HTML timeline view of appearances |
@@ -1192,7 +1199,6 @@ va report <id>          # after review
 | Adaptive sampling | Uniform 0.5fps works for MVP. Optimize after full pipeline validated. |
 | Clip export | Timestamps are the core output. FFmpeg one-liners work ad-hoc. |
 | Cross-video matching | Requires identity reference database. Build after single-video works. |
-| GPU acceleration | CPU is fast enough on M-series for single videos. |
 | Daemon/watch mode | Manual CLI is fine early on. Add after pipeline is stable. |
 | VHS preprocessing | Deinterlacing covers the biggest issue. Advanced noise reduction can wait. |
 | Split cluster UI | Merge is more common than split. Add when you hit bad clusters. |
@@ -1478,9 +1484,82 @@ tab deleted or renamed the target), the confirm handler bounces back to
 zero-value data. Catches field/func-name drift before render time. Not a correctness
 test, just a "doesn't blow up." Worth keeping in sync if templates get refactored.
 
----
+## CoreML execution provider (measured 2× on M-series)
 
-# Next Evolution: Scene-Aware Retrieval
+`worker/worker.py` accepts `--provider {auto,coreml,cpu}`; `auto` picks CoreML
+on macOS and transparently falls back to CPU if EP init fails. `/health` now
+reports the resolved provider list so you can verify what's actually running:
+
+```
+curl -s localhost:8089/health | jq .providers
+# → ["CoreMLExecutionProvider","CPUExecutionProvider"]
+```
+
+Measured on colton-being-colton (126 VHS frames, buffalo_l pack): **11.75 s
+CPU → 5.88 s CoreML (2.0×)**. Not the 5× older drafts predicted — the
+`/detect` loop processes one `cv2.imread` + `face_app.get(img)` per frame,
+so ANE can't amortize across a batch.
+
+**fp16 embedding drift:** CoreML runs ArcFace on the Neural Engine in fp16
+while CPU stays fp32. Detection (bbox + confidence) is bit-identical; the
+512-dim embedding diverges around the third significant figure. Back-of-envelope:
+self-similarity stays >0.995, so cluster boundaries and the 0.5 auto-match
+threshold aren't meaningfully affected — but don't **mix** CPU-era and
+CoreML-era reference embeddings under the same identity. If you've processed
+videos under one EP and are switching, re-embed under the new EP before the
+next batch run so the entire reference set lives in one version of the
+embedding space.
+
+First `va detect` after a worker restart includes a ~3 s CoreML graph-compile
+penalty. Subsequent calls are steady-state.
+
+## Adaptive scout+fill sampling
+
+`pipeline/fill.go` + `va fill <id>` implement Pass 2 of the original design
+§2 sampling plan. After scout-pass detect runs, each detection timestamp is
+expanded into a window `[t - PaddingMs, t + PaddingMs]` (default 2000 ms),
+overlapping windows are merged, and frames are extracted at `--fps` inside
+those windows (default 2.0 fps). New frames are inserted with `pass="fill"`
+and the pipeline re-runs detect on them.
+
+Wired into `va run` and `va run-all` between the first and second detect pass.
+Idempotent — re-running with existing fill frames is a no-op.
+
+### Measured on christmas-2005 (8:58, crowded scenes)
+
+| | Scout only | Scout + fill |
+|---|---|---|
+| Frames extracted | 269 | 269 + 675 = 944 |
+| Face detections | 614 | 2,432 (**4×**) |
+| Fill wallclock | — | ~9 min (17 windows) |
+
+### Tradeoff reading
+
+Fill is a *data-quality* lever, not a *speed* lever. Against the prior
+uniform-0.5-fps baseline, fill **adds** detection work (2–4× detections on
+face-heavy content). The original design pitched adaptive sampling as a
+~50% GPU-work saving — that saving only materializes when the comparison
+baseline is uniform-dense sampling. It's a net win vs dense, a net cost vs
+sparse, and it turns the sparse baseline into something close to
+as-dense-where-it-matters.
+
+Cost breakdown on crowded content: ~8 min of the 9 min fill wallclock is
+ffmpeg startup+seek overhead across per-window `-ss` invocations. If that
+becomes the bottleneck on the full archive, the next optimization is to
+collapse fill windows into a single ffmpeg call per recording via
+`-vf "select='between(t,s1,e1)+...'"`.
+
+### Track/cluster state after retroactive fill
+
+Fill is a **pre-track stage**. `FillSampleAroundDetections` refuses to run
+(returns `Skipped=true, SkipReason="tracks_exist"`) if the recording
+already has tracks, because `TrackFaces` is itself idempotent ("tracks
+exist → skip") and fill's new detections would orphan: they'd sit in the
+DB without being tracked or clustered, wasting CPU time and taking up rows.
+The clean move when adopting fill on an already-processed recording is
+to wipe tracks + clusters (+ embeddings on future fill detections) and
+re-run the downstream pipeline. For now there's no `--force` flag — do
+the deletion manually in SQL if you really want to.
 
 ## North Star
 
@@ -1790,21 +1869,22 @@ home-video collection at `~/Desktop/Home Videos`.
 | File size range | ~20 MB (1-min clips) to ~20 GB (multi-hour "Family LONG" tapes) |
 | Container formats | mostly `.mov` and `.mp4` (both browser-playable) |
 
-## Expected processing time (CPU)
+## Expected processing time
 
-Based on measured throughput on the test recordings:
+Based on measured throughput on the test recordings (M-series Mac):
 
-| Stage | Per hour of video | For 18 hours |
-|-------|-------------------|--------------|
-| Sampling (ffmpeg, 0.5 fps) | ~1 min | ~18 min |
-| Scene detection (yadif+hqdn3d+scdet) | ~30 s | ~9 min |
-| Face detection (RetinaFace, CPU) | ~27 min | **~8 hours** |
-| Embedding (ArcFace, CPU) | ~1.5 min | ~27 min |
-| Tracking/clustering/matching | <1 min | trivial |
-| **Total wallclock** | — | **~8–10 hours** |
+| Stage | Per hour (CPU) | Per hour (CoreML) | 18 hr archive (CoreML) |
+|-------|----------------|-------------------|------------------------|
+| Sampling (ffmpeg, 0.5 fps) | ~1 min | ~1 min | ~18 min |
+| Scene detection (yadif+hqdn3d+scdet) | ~30 s | ~30 s | ~9 min |
+| Face detection + embedding (buffalo_l) | ~28 min | ~14 min | **~4 hr** |
+| Tracking/clustering/matching | <1 min | <1 min | trivial |
+| **Total wallclock** | ~30 min | ~15 min | **~4–5 hr** |
 
-Detection dominates. GPU acceleration (CoreML/Metal provider) would cut this
-to ~1–2 hours but is deferred (see V2 roadmap).
+Detection+embedding dominates; CoreML delivers ~2× there, not the 5× earlier
+drafts predicted (see "CPU vs CoreML" under Performance Considerations).
+Further gains would come from adaptive sampling (next) and/or worker-side
+batch inference.
 
 Expected derived-data growth: ~2–3 GB (frames + crops). Database: MB range.
 

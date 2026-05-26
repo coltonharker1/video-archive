@@ -7,17 +7,31 @@ import (
 )
 
 // InsertFrame inserts a frame sample record. Uses INSERT OR IGNORE to
-// skip duplicates (recording_id, timestamp_ms is UNIQUE).
-func (db *DB) InsertFrame(f *model.FrameSample) (int64, error) {
+// skip duplicates (recording_id, timestamp_ms is UNIQUE). The returned
+// bool is true if a new row was written, false if an existing row with
+// the same (recording_id, timestamp_ms) caused the insert to be skipped.
+//
+// LastInsertId is not reliable for distinguishing the ignored case on
+// modernc/sqlite — it returns the *previous* successful insert's rowid
+// rather than 0 when OR IGNORE skips. RowsAffected is the correct signal.
+func (db *DB) InsertFrame(f *model.FrameSample) (int64, bool, error) {
 	result, err := db.conn.Exec(`
 		INSERT OR IGNORE INTO frames (recording_id, timestamp_ms, pass, frame_path, width, height)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		f.RecordingID, f.TimestampMs, f.Pass, f.FramePath, f.Width, f.Height,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("inserting frame: %w", err)
+		return 0, false, fmt.Errorf("inserting frame: %w", err)
 	}
-	return result.LastInsertId()
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("checking rows affected: %w", err)
+	}
+	if affected == 0 {
+		return 0, false, nil
+	}
+	id, err := result.LastInsertId()
+	return id, true, err
 }
 
 // CountFrames returns the number of frames for a recording, optionally filtered by pass.

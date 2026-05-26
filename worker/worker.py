@@ -11,11 +11,13 @@ Usage:
     python worker.py                     # starts on port 8089
     python worker.py --port 9000         # custom port
     python worker.py --det-thresh 0.3    # lower detection threshold for VHS
+    python worker.py --provider cpu      # force CPU (default: auto — CoreML on macOS)
 """
 
 import argparse
 import logging
 import os
+import platform
 import sys
 import time
 
@@ -71,6 +73,7 @@ class HealthResponse(BaseModel):
     status: str
     models_loaded: bool
     det_thresh: float
+    providers: list[str]
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -81,26 +84,62 @@ app = FastAPI(title="Video Archive ML Worker")
 # Global state — set during startup
 face_app = None
 det_thresh = 0.5
+active_providers: list[str] = []
 
 
-def load_models(model_name: str = "buffalo_l", threshold: float = 0.5):
+def resolve_providers(choice: str) -> list[str]:
+    """Map --provider choice to an ONNX Runtime provider list.
+
+    auto: CoreML+CPU on macOS (Apple Silicon sees the biggest win via ANE/GPU),
+          CPU everywhere else. CPU is always appended so ORT falls through
+          per-node if any op isn't supported by CoreML.
+    """
+    choice = choice.lower()
+    if choice == "cpu":
+        return ["CPUExecutionProvider"]
+    if choice == "coreml":
+        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    if platform.system() == "Darwin":
+        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+def load_models(model_name: str = "buffalo_l", threshold: float = 0.5, provider: str = "auto"):
     """Load insightface models. Downloads automatically on first run."""
-    global face_app, det_thresh
+    global face_app, det_thresh, active_providers
     det_thresh = threshold
 
     from insightface.app import FaceAnalysis
 
-    log.info("loading insightface model pack: %s (threshold=%.2f)", model_name, threshold)
+    providers = resolve_providers(provider)
+    log.info("loading insightface model pack: %s (threshold=%.2f, providers=%s)",
+             model_name, threshold, providers)
     t0 = time.time()
 
-    face_app = FaceAnalysis(
-        name=model_name,
-        providers=["CPUExecutionProvider"],
-    )
-    face_app.prepare(ctx_id=0, det_thresh=threshold, det_size=(640, 640))
+    try:
+        face_app = FaceAnalysis(name=model_name, providers=providers)
+        face_app.prepare(ctx_id=0, det_thresh=threshold, det_size=(640, 640))
+    except Exception as e:
+        if "CoreMLExecutionProvider" in providers and providers != ["CPUExecutionProvider"]:
+            log.warning("CoreML provider init failed (%s); falling back to CPU", e)
+            face_app = FaceAnalysis(name=model_name, providers=["CPUExecutionProvider"])
+            face_app.prepare(ctx_id=0, det_thresh=threshold, det_size=(640, 640))
+        else:
+            raise
+
+    seen: set[str] = set()
+    active_providers = []
+    for key, model in face_app.models.items():
+        sess = getattr(model, "session", None)
+        sess_providers = sess.get_providers() if sess is not None else []
+        log.info("  model=%s providers=%s", key, sess_providers)
+        for p in sess_providers:
+            if p not in seen:
+                seen.add(p)
+                active_providers.append(p)
 
     elapsed = time.time() - t0
-    log.info("models loaded in %.1fs", elapsed)
+    log.info("models loaded in %.1fs (active=%s)", elapsed, active_providers)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +152,7 @@ def health():
         status="ok" if face_app is not None else "not_ready",
         models_loaded=face_app is not None,
         det_thresh=det_thresh,
+        providers=active_providers,
     )
 
 
@@ -268,9 +308,11 @@ def main():
     parser.add_argument("--model", default="buffalo_l", help="insightface model pack name")
     parser.add_argument("--det-thresh", type=float, default=0.5,
                         help="face detection confidence threshold (lower for VHS: 0.3-0.5)")
+    parser.add_argument("--provider", default="auto", choices=["auto", "coreml", "cpu"],
+                        help="ONNX Runtime execution provider (auto: CoreML on macOS, CPU elsewhere)")
     args = parser.parse_args()
 
-    load_models(model_name=args.model, threshold=args.det_thresh)
+    load_models(model_name=args.model, threshold=args.det_thresh, provider=args.provider)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

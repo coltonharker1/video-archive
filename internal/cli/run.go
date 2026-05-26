@@ -119,6 +119,29 @@ func runPipeline(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Step 3b: Fill-sample around detections, then re-detect on new frames
+	fmt.Println("\n=== Step 3b: Fill sampling ===")
+	fillResult, err := pipeline.FillSampleAroundDetections(context.Background(), cfg, db, id, pipeline.DefaultFillOptions())
+	if err != nil {
+		slog.Warn("fill sampling failed; continuing with scout-only detections", "error", err)
+	} else if fillResult.Skipped {
+		switch fillResult.SkipReason {
+		case "tracks_exist":
+			fmt.Println("Fill skipped — recording already has tracks (fill is pre-track only)")
+		default:
+			fmt.Printf("Fill frames already exist (%d)\n", fillResult.FrameCount)
+		}
+	} else if fillResult.FrameCount > 0 {
+		fmt.Printf("Extracted %d fill frames across %d windows\n", fillResult.FrameCount, fillResult.WindowCount)
+		fillDetect, err := pipeline.DetectFaces(context.Background(), cfg, db, ml, id)
+		if err != nil {
+			return fmt.Errorf("fill detect failed: %w", err)
+		}
+		if !fillDetect.Skipped {
+			fmt.Printf("Fill detect: %d additional faces across %d frames\n", fillDetect.FacesFound, fillDetect.FramesDone)
+		}
+	}
+
 	// Step 4: Track
 	fmt.Println("\n=== Step 4: Track ===")
 	trackResult, err := pipeline.TrackFaces(context.Background(), cfg, db, id)

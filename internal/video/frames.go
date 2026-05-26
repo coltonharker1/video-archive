@@ -21,6 +21,12 @@ type ExtractFramesOptions struct {
 	Deinterlace bool    // apply yadif deinterlace filter
 	MaxWidth    int     // downscale to this width (0 = no scaling)
 	Pass        string  // label for filenames: "scout", "fill", "track"
+
+	// Optional window. When DurationMs > 0, only frames in the range
+	// [StartMs, StartMs+DurationMs) are extracted and the extracted frames'
+	// filenames carry absolute source-video timestamps (StartMs + i/FPS).
+	StartMs    int64
+	DurationMs int64
 }
 
 // ExtractFramesResult describes the output of frame extraction.
@@ -47,17 +53,32 @@ func ExtractFrames(ctx context.Context, ffmpegPath string, opts ExtractFramesOpt
 	}
 	filters = append(filters, fmt.Sprintf("fps=%.4f", opts.FPS))
 
-	// FFmpeg outputs sequential frame numbers. We use a tmp_ prefix and
-	// rename to timestamp-based names after extraction.
-	tmpPattern := filepath.Join(opts.OutputDir, "tmp_%06d.jpg")
+	// FFmpeg outputs sequential frame numbers into per-window tmp files so
+	// concurrent-window extractions don't collide. Scout pass keeps the
+	// historical tmp_ prefix.
+	tmpPrefix := "tmp_"
+	if opts.DurationMs > 0 {
+		tmpPrefix = fmt.Sprintf("tmp_w%d_", opts.StartMs)
+	}
+	tmpPattern := filepath.Join(opts.OutputDir, tmpPrefix+"%06d.jpg")
 
-	args := []string{
+	args := []string{}
+	if opts.DurationMs > 0 {
+		// -ss before -i uses keyframe-accurate fast seek (±<1s on VHS),
+		// which is fine — we're looking for faces within a window, not
+		// aiming for frame-perfect timestamps.
+		args = append(args,
+			"-ss", fmt.Sprintf("%.3f", float64(opts.StartMs)/1000),
+			"-t", fmt.Sprintf("%.3f", float64(opts.DurationMs)/1000),
+		)
+	}
+	args = append(args,
 		"-i", opts.InputPath,
 		"-vf", strings.Join(filters, ","),
 		"-q:v", "2",
 		"-start_number", "0",
 		tmpPattern,
-	}
+	)
 
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	applySubprocessSafety(cmd)
@@ -78,18 +99,24 @@ func ExtractFrames(ctx context.Context, ffmpegPath string, opts ExtractFramesOpt
 
 	var tmpFiles []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), "tmp_") && strings.HasSuffix(e.Name(), ".jpg") {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), tmpPrefix) && strings.HasSuffix(e.Name(), ".jpg") {
 			tmpFiles = append(tmpFiles, e.Name())
 		}
 	}
 	sort.Strings(tmpFiles)
 
 	for i, name := range tmpFiles {
-		timestampMs := int64(float64(i) / opts.FPS * 1000)
+		timestampMs := opts.StartMs + int64(float64(i)/opts.FPS*1000)
 		newName := fmt.Sprintf("%s_%012d.jpg", opts.Pass, timestampMs)
 
 		oldPath := filepath.Join(opts.OutputDir, name)
 		newPath := filepath.Join(opts.OutputDir, newName)
+		if _, err := os.Stat(newPath); err == nil {
+			// A frame at this exact timestamp already exists (e.g. overlapping
+			// window with prior scout/fill output). Drop the duplicate.
+			os.Remove(oldPath)
+			continue
+		}
 		if err := os.Rename(oldPath, newPath); err != nil {
 			slog.Warn("failed to rename frame", "from", name, "to", newName, "error", err)
 		}
